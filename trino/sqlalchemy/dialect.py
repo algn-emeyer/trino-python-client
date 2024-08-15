@@ -36,6 +36,8 @@ from .datatype import JSONIndexType, JSONPathType
 
 logger = logging.get_logger(__name__)
 
+cache_columns = {}
+
 colspecs = {
     sqltypes.JSON.JSONIndexType: JSONIndexType,
     sqltypes.JSON.JSONPathType: JSONPathType,
@@ -179,29 +181,36 @@ class TrinoDialect(DefaultDialect):
 
     def _get_columns(self, connection: Connection, table_name: str, schema: str = None, **kw) -> List[Dict[str, Any]]:
         schema = schema or self._get_default_schema_name(connection)
-        query = dedent(
+        if not cache_columns:
+            query = dedent(
+                """
+                SELECT
+                    "table_name",
+                    "column_name",
+                    "data_type",
+                    "column_default",
+                    UPPER("is_nullable") AS "is_nullable"
+                FROM "information_schema"."columns"
+                WHERE "table_schema" = :schema
+                ORDER BY "table_schema","table_name","ordinal_position" ASC
             """
-            SELECT
-                "column_name",
-                "data_type",
-                "column_default",
-                UPPER("is_nullable") AS "is_nullable"
-            FROM "information_schema"."columns"
-            WHERE "table_schema" = :schema
-              AND "table_name" = :table
-            ORDER BY "ordinal_position" ASC
-        """
-        ).strip()
-        res = connection.execute(sql.text(query), {"schema": schema, "table": table_name})
+            ).strip()
+            res = connection.execute(sql.text(query), {"schema": schema})
+            logger.debug("trino:fetch_cache_columns")
+            for record in res:
+                cache_columns[schema+":"+record.table_name]=[schema,record.column_name,record.data_type,record.column_default,record.is_nullable]
+                logger.debug("trino:fetch_cache_columns:",cache_columns[schema+":"+record.table_name])
         columns = []
-        for record in res:
-            column = dict(
-                name=record.column_name,
-                type=datatype.parse_sqltype(record.data_type),
-                nullable=record.is_nullable == "YES",
-                default=record.column_default,
-            )
-            columns.append(column)
+        record=cache_columns[schema+":"+table_name]
+        print("trino:fetch_cache_columns:",schema,":",table_name,":",record)
+        logger.debug("trino:fetch_cache_columns:%s:%s:%s",schema,table_name,record)
+        column = dict(
+            name=record[1],
+            type=datatype.parse_sqltype(record[2]),
+            nullable=record[4] == "YES",
+            default=record[3],
+        )
+        columns.append(column)
         return columns
 
     def get_pk_constraint(self, connection: Connection, table_name: str, schema: str = None, **kw) -> Dict[str, Any]:
@@ -248,6 +257,7 @@ class TrinoDialect(DefaultDialect):
             FROM "information_schema"."tables"
             WHERE "table_schema" = :schema
               AND "table_type" = 'BASE TABLE'
+	    ORDER BY "table_name"
         """
         ).strip()
         res = connection.execute(sql.text(query), {"schema": schema})
