@@ -31,16 +31,27 @@ from trino.auth import (
 )
 from trino.dbapi import Cursor
 from trino.sqlalchemy import compiler, datatype, error
+import os
+import os.path
+import time
 
 from .datatype import JSONIndexType, JSONPathType
 
 logger = logging.get_logger(__name__)
 
+#
+# Do we prefetch the DDL for all tables, columns, etc.?
+#
 colspecs = {
     sqltypes.JSON.JSONIndexType: JSONIndexType,
     sqltypes.JSON.JSONPathType: JSONPathType,
 }
 
+
+def is_file_older_than_x_days(file, days=1): 
+    file_time = os.path.getmtime(file) 
+    # Check against 24 hours 
+    return ((time.time() - file_time) / 3600 > 24*days)
 
 class TrinoDialect(DefaultDialect):
     def __init__(self,
@@ -50,6 +61,18 @@ class TrinoDialect(DefaultDialect):
         DefaultDialect.__init__(self, **kwargs)
         self._json_serializer = json_serializer
         self._json_deserializer = json_deserializer
+
+    #
+    # DDL Caching Facility
+    prefetch_ddl = True
+    ttl_days=7
+    cache_columns = {}
+    cache_catalogs = {}
+    cache_schemas = {}
+    cache_tables = {}
+    cache_views = {}
+    cache_view_definitions = {}
+    cache_table_comments = {}
 
     name = "trino"
     driver = "rest"
@@ -170,6 +193,14 @@ class TrinoDialect(DefaultDialect):
         if "roles" in url.query:
             kwargs["roles"] = json.loads(url.query["roles"])
 
+        if "ddlCache" in url.query:
+            nbdays=json.loads(url.query["ddlCache"])
+            print("trino:ddlCache=",nbdays)
+            self.ttl_days = nbdays
+            self.prefetch_ddl = True
+            if (self.ttl_days<=0):
+                self.ttl_days=7          
+
         return args, kwargs
 
     def get_columns(self, connection: Connection, table_name: str, schema: str = None, **kw) -> List[Dict[str, Any]]:
@@ -177,31 +208,80 @@ class TrinoDialect(DefaultDialect):
             raise exc.NoSuchTableError(f"schema={schema}, table={table_name}")
         return self._get_columns(connection, table_name, schema, **kw)
 
+    def cache_load_columns(self, connection: Connection, schema: str = None):
+        filepath=os.path.abspath("cache_columns.json")
+        if (os.path.isfile(filepath) and not is_file_older_than_x_days(filepath, self.ttl_days)):
+            with open(filepath, "r") as file:
+                print("trino:load cache columns from file:",filepath)
+                self.cache_columns = json.load(file)
+        else:
+            query = dedent(
+                """
+                SELECT
+                    "table_name",
+                    "column_name",
+                    "data_type",
+                    "column_default",
+                    UPPER("is_nullable") AS "is_nullable"
+                FROM "information_schema"."columns"
+                WHERE "table_schema" = :schema
+                ORDER BY "table_schema","table_name","ordinal_position" ASC
+            """
+            ).strip()
+            res = connection.execute(sql.text(query), {"schema": schema})
+            logger.debug("trino:fetch_cache_columns")
+            for record in res:
+                sn=schema+":"+record.table_name
+                if sn not in self.cache_columns:
+                    self.cache_columns[sn]={}
+                self.cache_columns[sn][record.column_name]=dict(
+                    name=record.column_name,
+                    type=record.data_type,
+                    nullable=record.is_nullable=="YES",
+                    default=record.column_default
+                    )
+                print("trino:insert each column in cache:",sn,":",record.column_name,"->",self.cache_columns[sn])
+            with open(filepath, "w") as file:
+                json.dump(self.cache_columns, file)
+
     def _get_columns(self, connection: Connection, table_name: str, schema: str = None, **kw) -> List[Dict[str, Any]]:
         schema = schema or self._get_default_schema_name(connection)
-        query = dedent(
+        if self.prefetch_ddl:
+            if self.cache_columns=={}:
+                self.cache_load_columns(connection, schema)
+            columns = []
+            for record in self.cache_columns[schema+":"+table_name].values():
+                ztype=datatype.parse_sqltype(record["type"])
+                print("trino:find cache column:",schema,":",table_name,":",record,ztype)
+                column = record
+                column["type"]=ztype
+                columns.append(column)   
+            print("trino:columns=",columns)
+        else:
+            schema = schema or self._get_default_schema_name(connection)
+            query = dedent(
+                """
+                SELECT
+                    "column_name",
+                    "data_type",
+                    "column_default",
+                    UPPER("is_nullable") AS "is_nullable"
+                FROM "information_schema"."columns"
+                WHERE "table_schema" = :schema
+                AND "table_name" = :table
+                ORDER BY "ordinal_position" ASC
             """
-            SELECT
-                "column_name",
-                "data_type",
-                "column_default",
-                UPPER("is_nullable") AS "is_nullable"
-            FROM "information_schema"."columns"
-            WHERE "table_schema" = :schema
-              AND "table_name" = :table
-            ORDER BY "ordinal_position" ASC
-        """
-        ).strip()
-        res = connection.execute(sql.text(query), {"schema": schema, "table": table_name})
-        columns = []
-        for record in res:
-            column = dict(
-                name=record.column_name,
-                type=datatype.parse_sqltype(record.data_type),
-                nullable=record.is_nullable == "YES",
-                default=record.column_default,
-            )
-            columns.append(column)
+            ).strip()
+            res = connection.execute(sql.text(query), {"schema": schema, "table": table_name})
+            columns = []
+            for record in res:
+                column = dict(
+                    name=record.column_name,
+                    type=datatype.parse_sqltype(record.data_type),
+                    nullable=record.is_nullable == "YES",
+                    default=record.column_default,
+                )
+                columns.append(column)
         return columns
 
     def get_pk_constraint(self, connection: Connection, table_name: str, schema: str = None, **kw) -> Dict[str, Any]:
@@ -218,80 +298,236 @@ class TrinoDialect(DefaultDialect):
         """Trino has no support for foreign keys. Returns an empty list."""
         return []
 
-    def get_catalog_names(self, connection: Connection, **kw) -> List[str]:
+    def cache_load_catalogs(self, connection: Connection):
         query = dedent(
             """
             SELECT "table_cat"
             FROM "system"."jdbc"."catalogs"
-        """
+            """
         ).strip()
         res = connection.execute(sql.text(query))
-        return [row.table_cat for row in res]
+        logger.debug("trino:fetch_cache_catalogs")
+        cache_catalogs=[];
+        for record in res:
+            cache_catalogs.append(record.table_cat)
+        print("trino:insert each catalog in cache:->",cache_catalogs)
 
-    def get_schema_names(self, connection: Connection, **kw) -> List[str]:
+    def get_catalog_names(self, connection: Connection, **kw) -> List[str]:
+        if self.prefetch_ddl:
+            if self.cache_catalogs=={}:
+                self.cache_load_catalogs(connection)
+            catalogs = []
+            for record in cache_catalogs.values():
+                print("trino:find cache catalog:",record)
+                catalog = record
+                catalogs.append(catalog)   
+            print("trino:catalogs=",catalogs)
+            return[catalog.table_cat for catalog in catalogs]
+        else:
+            query = dedent(
+                """
+                SELECT "table_cat"
+                FROM "system"."jdbc"."catalogs"
+            """
+            ).strip()
+            res = connection.execute(sql.text(query))
+            return [row.table_cat for row in res]
+
+    def cache_load_schemas(self, connection: Connection):
         query = dedent(
             """
             SELECT "schema_name"
             FROM "information_schema"."schemata"
-        """
+            """
         ).strip()
         res = connection.execute(sql.text(query))
-        return [row.schema_name for row in res]
+        logger.debug("trino:fetch_cache_schemas")
+        for record in res:
+            self.cache_schemas[record.schema_name]=dict(
+                schema_name=record.schema_name
+                )
+            print("trino:insert each schame in cache:->",self.cache_schemas[record.schema_name])
+
+    def get_schema_names(self, connection: Connection, **kw) -> List[str]:
+        if self.prefetch_ddl:
+            if self.cache_schemas=={}:
+                    self.cache_load_schemas(connection)
+            schemas = []
+            for record in self.cache_schemas.values():
+                print("trino:find cache schemas:",record)
+                schema = record
+                schemas.append(schema)   
+            print("trino:schemas=",schemas)
+            return[schema.schema_name for schema in schemas]
+        else:
+            query = dedent(
+                """
+                SELECT "schema_name"
+                FROM "information_schema"."schemata"
+                """
+            ).strip()
+            res = connection.execute(sql.text(query))
+            return [row.schema_name for row in res]
+
+    def cache_load_tables(self, connection: Connection, schema: str = None):
+        filepath=os.path.abspath("cache_tables.json")
+        if (os.path.isfile(filepath) and not is_file_older_than_x_days(filepath, self.ttl_days)):
+            print("trino:load cache tables from file:",filepath)
+            with open(filepath, "r") as file:
+                self.cache_tables = json.load(file)
+        else:
+            query = dedent(
+                """
+                SELECT "table_name"
+                FROM "information_schema"."tables"
+                WHERE "table_schema" = :schema
+                AND "table_type" = 'BASE TABLE'
+                ORDER BY "table_name"
+                """
+            ).strip()
+            res = connection.execute(sql.text(query), {"schema": schema})
+            logger.debug("trino:fetch_cache_tables")
+            self.cache_tables[schema]=[]
+            for record in res:
+                self.cache_tables[schema].append(record.table_name)
+            print("trino:insert each table in cache:->",self.cache_tables[schema])
+            with open(filepath, "w") as file:  
+                json.dump(self.cache_tables, file)
 
     def get_table_names(self, connection: Connection, schema: str = None, **kw) -> List[str]:
         schema = schema or self._get_default_schema_name(connection)
         if schema is None:
             raise exc.NoSuchTableError("schema is required")
-        query = dedent(
-            """
-            SELECT "table_name"
-            FROM "information_schema"."tables"
-            WHERE "table_schema" = :schema
-              AND "table_type" = 'BASE TABLE'
-        """
-        ).strip()
-        res = connection.execute(sql.text(query), {"schema": schema})
-        return [row.table_name for row in res]
+        if self.prefetch_ddl:
+            if self.cache_tables=={}:
+                self.cache_load_tables(connection,schema)
+            return self.cache_tables[schema]
+        else:
+            query = dedent(
+                """
+                SELECT "table_name"
+                FROM "information_schema"."tables"
+                WHERE "table_schema" = :schema
+                AND "table_type" = 'BASE TABLE'
+                ORDER BY "table_name"
+                """
+            ).strip()
+            res = connection.execute(sql.text(query), {"schema": schema})
+            return [row.table_name for row in res]
 
     def get_temp_table_names(self, connection: Connection, schema: str = None, **kw) -> List[str]:
         """Trino has no support for temporary tables. Returns an empty list."""
         return []
 
+    def cache_load_views(self, connection: Connection, schema: str = None):
+        filepath=os.path.abspath("cache_views.json")
+        if (os.path.isfile(filepath) and not is_file_older_than_x_days(filepath, self.ttl_days)):
+            with open(filepath, "r") as file:
+                print("trino:load cache views from file:",filepath)
+                self.cache_views = json.load(file)
+        else:
+            query = dedent(
+                """
+                SELECT "table_name"
+                FROM "information_schema"."tables"
+                WHERE "table_schema" = :schema
+                AND "table_type" = 'VIEW'
+                ORDER BY "table_name"
+                """
+            ).strip()
+            res = connection.execute(sql.text(query), {"schema": schema})
+            logger.debug("trino:fetch_cache_views")
+            for record in res:
+                self.cache_viewss[record.table_name]=dict(
+                    name=record.table_name
+                    )
+            print("trino:insert each view in cache:->",cache_views[record.table_name])
+            with open(filepath, "w") as file:
+                json.dump(self.cache_views, file)
+
     def get_view_names(self, connection: Connection, schema: str = None, **kw) -> List[str]:
         schema = schema or self._get_default_schema_name(connection)
         if schema is None:
             raise exc.NoSuchTableError("schema is required")
-
-        # Querying the information_schema.views table is subpar as it compiles the view definitions.
-        query = dedent(
+        if self.prefetch_ddl:
+            if self.cache_views=={}:
+                self.cache_load_views(connection, schema)
+            views = []
+            for record in self.cache_views[schema].values():
+                print("trino:find cache view:",record)
+                view = record
+                views.append(view)   
+            print("trino:views=",views)
+            return [view.name for view in views]
+        else:
+            # Querying the information_schema.views table is subpar as it compiles the view definitions.
+            query = dedent(
+                """
+                SELECT "table_name"
+                FROM "information_schema"."tables"
+                WHERE "table_schema" = :schema
+                AND "table_type" = 'VIEW'
             """
-            SELECT "table_name"
-            FROM "information_schema"."tables"
-            WHERE "table_schema" = :schema
-              AND "table_type" = 'VIEW'
-        """
-        ).strip()
-        res = connection.execute(sql.text(query), {"schema": schema})
-        return [row.table_name for row in res]
+            ).strip()
+            res = connection.execute(sql.text(query), {"schema": schema})
+            return [row.table_name for row in res]
 
     def get_temp_view_names(self, connection: Connection, schema: str = None, **kw) -> List[str]:
         """Trino has no support for temporary views. Returns an empty list."""
         return []
 
+    def cache_load_view_definitions(self, connection: Connection, schema: str = None):
+        filepath=os.path.abspath("cache_view_definitions.json")
+        if (os.path.isfile(filepath) and not is_file_older_than_x_days(filepath, self.ttl_days)):
+            with open(filepath, "r") as file:
+                print("trino:load cache view definitions from file:",filepath)
+                self.cache_view_definitions = json.load(file)
+        else:
+            query = dedent(
+                """
+                SELECT "table_name","view_definition"
+                FROM "information_schema"."views"
+                WHERE "table_schema" = :schema
+            """
+            ).strip()
+            res = connection.execute(sql.text(query), {"schema": schema})
+            logger.debug("trino:fetch_cache_view_definitions")
+            for record in res:
+                sn=schema+":"+record.table_name
+                if sn not in self.cache_view_definitons:
+                    self.cache_view_definitions[sn]={}
+                self.cache_view_definitions[sn][record.table_name]=dict(
+                    view_definition=record.view_definition
+                    )
+                print("trino:insert each view_definition in cache:",sn,":->",self.cache_view_definitions[sn])
+            with open(filepath, "w") as file:
+                json.dump(self.cache_view_definitions, file)
+
     def get_view_definition(self, connection: Connection, view_name: str, schema: str = None, **kw) -> str:
         schema = schema or self._get_default_schema_name(connection)
         if schema is None:
             raise exc.NoSuchTableError("schema is required")
-        query = dedent(
+        if self.prefetch_ddl:
+            if self.cache_view_definitons=={}:
+                self.cache_load_view_definitions(connection, schema)
+            view_definitions = []
+            for record in self.cache_view_definitions[schema+":"+view_name].values():
+                print("trino:find cache view_definition:",schema,":",view_name,":",record)
+                view_definition = record
+                view_definitions.append(view_definition)   
+            print("trino:view_definitions=",view_definitions,":",view_definition)
+            return view_definition
+        else:
+            query = dedent(
+                """
+                SELECT "view_definition"
+                FROM "information_schema"."views"
+                WHERE "table_schema" = :schema
+                AND "table_name" = :view
             """
-            SELECT "view_definition"
-            FROM "information_schema"."views"
-            WHERE "table_schema" = :schema
-              AND "table_name" = :view
-        """
-        ).strip()
-        res = connection.execute(sql.text(query), {"schema": schema, "view": view_name})
-        return res.scalar()
+            ).strip()
+            res = connection.execute(sql.text(query), {"schema": schema, "view": view_name})
+            return res.scalar()
 
     def get_indexes(self, connection: Connection, table_name: str, schema: str = None, **kw) -> List[Dict[str, Any]]:
         if not self.has_table(connection, table_name, schema):
@@ -328,6 +564,34 @@ class TrinoDialect(DefaultDialect):
         """Trino has no support for check constraints. Returns an empty list."""
         return []
 
+    def cache_load_table_comments(self, connection: Connection, catalog_name: str = None, schema: str = None):
+        filepath=os.path.abspath("cache_table_comments.json")
+        if (os.path.isfile(filepath) and not is_file_older_than_x_days(filepath, self.ttl_days)):
+            with open(filepath, "r") as file:
+                print("trino:load cache table comments from file:",filepath)
+                self.cache_table_comments = json.load(file)
+        else:
+            query = dedent(
+                    """
+                        SELECT "table_name","comment"
+                        FROM "system"."metadata"."table_comments"
+                        WHERE "catalog_name" = :catalog_name
+                        AND "schema_name" = :schema_name
+                    """
+            ).strip()
+            res = connection.execute(sql.text(query), {"schema_name": schema, "catalog_name": catalog_name})
+            logger.debug("trino:fetch_cache_table_comments")
+            for record in res:
+                sn=schema+":"+record.table_name
+                if sn not in self.cache_table_comments:
+                    self.cache_table_comments[sn]={}
+                self.cache_table_comments[sn][record.table_name]=dict(
+                    comment=record.comment
+                    )
+                print("trino:insert each table_comment in cache:",sn,":->",self.cache_table_comments[sn])
+            with open(filepath, "w") as file:
+                json.dump(self.cache_table_comments, file)
+
     def get_table_comment(self, connection: Connection, table_name: str, schema: str = None, **kw) -> Dict[str, Any]:
         catalog_name = self._get_default_catalog_name(connection)
         if catalog_name is None:
@@ -335,53 +599,72 @@ class TrinoDialect(DefaultDialect):
         schema_name = schema or self._get_default_schema_name(connection)
         if schema_name is None:
             raise exc.NoSuchTableError("schema is required")
-        query = dedent(
-            """
-            SELECT "comment"
-            FROM "system"."metadata"."table_comments"
-            WHERE "catalog_name" = :catalog_name
-              AND "schema_name" = :schema_name
-              AND "table_name" = :table_name
-        """
-        ).strip()
-        try:
-            res = connection.execute(
-                sql.text(query),
-                {"catalog_name": catalog_name, "schema_name": schema_name, "table_name": table_name}
-            )
-            return dict(text=res.scalar())
-        except error.TrinoQueryError as e:
-            if e.error_name in (
-                error.PERMISSION_DENIED,
-            ):
-                return dict(text=None)
-            raise
+        if self.prefetch_ddl:
+            if self.cache_table_comments=={}:
+                self.cache_load_table_comments(connection, catalog_name, schema)
+            record=self.cache_table_comments[schema+":"+table_name].values()
+            print("trino:find cache table_comments:",schema,":",table_name,":",record)
+            comment = record
+            print("trino:table_comments:",comment," from ",record)
+            return dict(text=comment)
+        else:
+            query = dedent(
+                    """
+                    SELECT "comment"
+                    FROM "system"."metadata"."table_comments"
+                    WHERE "catalog_name" = :catalog_name
+                    AND "schema_name" = :schema_name
+                    AND "table_name" = :table_name
+                """
+                ).strip()
+            try:
+                res = connection.execute(
+                    sql.text(query),
+                    {"catalog_name": catalog_name, "schema_name": schema_name, "table_name": table_name}
+                )
+                return dict(text=res.scalar())
+            except error.TrinoQueryError as e:
+                if e.error_name in (
+                    error.PERMISSION_DENIED,
+                ):
+                    return dict(text=None)
+                raise
 
     def has_schema(self, connection: Connection, schema: str) -> bool:
-        query = dedent(
+        if self.prefetch_ddl:
+            if self.cache_schemas=={}:
+                self.cache_load_schemas(connection)
+            return(self.cache_schema[schema] is not None)
+        else:
+            query = dedent(
+                """
+                SELECT "schema_name"
+                FROM "information_schema"."schemata"
+                WHERE "schema_name" = :schema
             """
-            SELECT "schema_name"
-            FROM "information_schema"."schemata"
-            WHERE "schema_name" = :schema
-        """
-        ).strip()
-        res = connection.execute(sql.text(query), {"schema": schema})
-        return res.first() is not None
+            ).strip()
+            res = connection.execute(sql.text(query), {"schema": schema})
+            return res.first() is not None
 
     def has_table(self, connection: Connection, table_name: str, schema: str = None, **kw) -> bool:
         schema = schema or self._get_default_schema_name(connection)
         if schema is None:
             return False
-        query = dedent(
+        if self.prefetch_ddl:
+            if self.cache_tables=={}:
+                self.cache_load_tables(connection, schema)
+            return(table_name in self.cache_tables[schema])
+        else:
+            query = dedent(
+                """
+                SELECT "table_name"
+                FROM "information_schema"."tables"
+                WHERE "table_schema" = :schema
+                AND "table_name" = :table
             """
-            SELECT "table_name"
-            FROM "information_schema"."tables"
-            WHERE "table_schema" = :schema
-              AND "table_name" = :table
-        """
-        ).strip()
-        res = connection.execute(sql.text(query), {"schema": schema, "table": table_name})
-        return res.first() is not None
+            ).strip()
+            res = connection.execute(sql.text(query), {"schema": schema, "table": table_name})
+            return res.first() is not None
 
     def has_sequence(self, connection: Connection, sequence_name: str, schema: str = None, **kw) -> bool:
         """Trino has no support for sequence. Returns False indicate that given sequence does not exists."""
