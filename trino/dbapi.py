@@ -157,6 +157,7 @@ class Connection(object):
         legacy_prepared_statements=None,
         roles=None,
         timezone=None,
+        ddlCache=None
     ):
         # Automatically assign http_schema, port based on hostname
         parsed_host = urlparse(host, allow_fragments=False)
@@ -194,6 +195,7 @@ class Connection(object):
         self.max_attempts = max_attempts
         self.request_timeout = request_timeout
         self.client_tags = client_tags
+        self.ddlCache = ddlCache
 
         self._isolation_level = isolation_level
         self._request = None
